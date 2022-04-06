@@ -1,11 +1,10 @@
-CC=gcc
 CFLAGS=-Wall -Wextra -Wpedantic
 
-c2_client: client.o 
-	$(CC) $(CFLAGS) -o c2_client client.o 
+linux: client.c base32.c 
+	gcc $(CFLAGS) -o client client.c base32.c 
 
-client.o: client.c
-	$(CC) $(CFLAGS) -c client.c
+windows: 
+	x86_64-w64-mingw32-gcc-win32 -o client.exe client.c base32.c $(CFLAGS) -lwsock32 -liphlpapi
 
 clean:
-	rm client.o c2_client
+	rm client client.exe
